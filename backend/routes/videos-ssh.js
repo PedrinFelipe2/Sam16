@@ -4,8 +4,166 @@ const fs = require('fs').promises;
 const db = require('../config/database');
 const authMiddleware = require('../middlewares/authMiddleware');
 const VideoSSHManager = require('../config/VideoSSHManager');
+const SSHManager = require('../config/SSHManager');
 
 const router = express.Router();
+
+// GET /api/videos-ssh/folders/:folderId/usage - Estatísticas de uso da pasta
+router.get('/folders/:folderId/usage', authMiddleware, async (req, res) => {
+  try {
+    const { folderId } = req.params;
+    const userId = req.user.id;
+    const userLogin = req.user.email.split('@')[0];
+
+    // Buscar dados da pasta e servidor
+    const [folderRows] = await db.execute(
+      'SELECT identificacao, codigo_servidor, espaco, espaco_usado FROM streamings WHERE codigo = ? AND codigo_cliente = ?',
+      [folderId, userId]
+    );
+
+    if (folderRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Pasta não encontrada'
+      });
+    }
+
+    const folder = folderRows[0];
+    const serverId = folder.codigo_servidor || 1;
+    const folderName = folder.identificacao;
+
+    // Calcular uso real da pasta via SSH
+    try {
+      const remotePath = `/usr/local/WowzaStreamingEngine/content/${userLogin}/${folderName}`;
+      const duCommand = `du -sb "${remotePath}" 2>/dev/null | cut -f1 || echo "0"`;
+      const result = await SSHManager.executeCommand(serverId, duCommand);
+      const realUsage = parseInt(result.stdout.trim()) || 0;
+      
+      // Converter para MB
+      const realUsageMB = Math.ceil(realUsage / (1024 * 1024));
+      
+      res.json({
+        success: true,
+        usage: {
+          used: realUsageMB,
+          total: folder.espaco,
+          percentage: Math.round((realUsageMB / folder.espaco) * 100),
+          available: folder.espaco - realUsageMB,
+          database_used: folder.espaco_usado,
+          real_used: realUsageMB
+        }
+      });
+    } catch (sshError) {
+      // Fallback para dados do banco
+      res.json({
+        success: true,
+        usage: {
+          used: folder.espaco_usado,
+          total: folder.espaco,
+          percentage: Math.round((folder.espaco_usado / folder.espaco) * 100),
+          available: folder.espaco - folder.espaco_usado,
+          database_used: folder.espaco_usado,
+          real_used: folder.espaco_usado
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Erro ao obter estatísticas de uso:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erro ao obter estatísticas de uso'
+    });
+  }
+});
+
+// POST /api/videos-ssh/folders/:folderId/sync - Sincronizar pasta com servidor
+router.post('/folders/:folderId/sync', authMiddleware, async (req, res) => {
+  try {
+    const { folderId } = req.params;
+    const userId = req.user.id;
+    const userLogin = req.user.email.split('@')[0];
+
+    // Buscar dados da pasta
+    const [folderRows] = await db.execute(
+      'SELECT identificacao, codigo_servidor FROM streamings WHERE codigo = ? AND codigo_cliente = ?',
+      [folderId, userId]
+    );
+
+    if (folderRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Pasta não encontrada'
+      });
+    }
+
+    const folder = folderRows[0];
+    const serverId = folder.codigo_servidor || 1;
+    const folderName = folder.identificacao;
+
+    // Listar vídeos do servidor
+    const videos = await VideoSSHManager.listVideosFromServer(serverId, userLogin, folderName);
+    
+    // Sincronizar com banco de dados
+    let syncedCount = 0;
+    let totalSize = 0;
+
+    for (const video of videos) {
+      try {
+        // Verificar se vídeo já existe no banco
+        const relativePath = `/${userLogin}/${folderName}/${video.nome}`;
+        const [existingRows] = await db.execute(
+          'SELECT codigo FROM playlists_videos WHERE path_video = ?',
+          [relativePath]
+        );
+
+        if (existingRows.length === 0) {
+          // Inserir novo vídeo no banco
+          await db.execute(
+            `INSERT INTO playlists_videos (
+              codigo_playlist, path_video, video, width, height,
+              bitrate, duracao, duracao_segundos, tipo, ordem, tamanho_arquivo
+            ) VALUES (0, ?, ?, 1920, 1080, 2500, ?, ?, 'video', 0, ?)`,
+            [
+              relativePath,
+              video.nome,
+              VideoSSHManager.formatDuration(video.duration),
+              video.duration,
+              video.size
+            ]
+          );
+          syncedCount++;
+        }
+        
+        totalSize += video.size;
+      } catch (dbError) {
+        console.error(`Erro ao sincronizar vídeo ${video.nome}:`, dbError);
+      }
+    }
+
+    // Atualizar espaço usado no banco
+    const totalSizeMB = Math.ceil(totalSize / (1024 * 1024));
+    await db.execute(
+      'UPDATE streamings SET espaco_usado = ? WHERE codigo = ?',
+      [totalSizeMB, folderId]
+    );
+
+    res.json({
+      success: true,
+      message: `Sincronização concluída: ${syncedCount} novos vídeos adicionados`,
+      stats: {
+        total_videos: videos.length,
+        synced_videos: syncedCount,
+        total_size_mb: totalSizeMB
+      }
+    });
+  } catch (error) {
+    console.error('Erro na sincronização:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erro na sincronização com servidor'
+    });
+  }
+});
 
 // PUT /api/videos-ssh/:videoId/rename - Renomear vídeo
 router.put('/:videoId/rename', authMiddleware, async (req, res) => {
@@ -54,6 +212,18 @@ router.put('/:videoId/rename', authMiddleware, async (req, res) => {
     const renameCommand = `mv "${remotePath}" "${newRemotePath}"`;
     await SSHManager.executeCommand(serverId, renameCommand);
 
+    // Atualizar banco de dados se o vídeo estiver registrado
+    try {
+      const oldRelativePath = remotePath.replace('/usr/local/WowzaStreamingEngine/content', '');
+      const newRelativePath = newRemotePath.replace('/usr/local/WowzaStreamingEngine/content', '');
+      
+      await db.execute(
+        'UPDATE playlists_videos SET path_video = ?, video = ? WHERE path_video = ?',
+        [newRelativePath, novo_nome.trim(), oldRelativePath]
+      );
+    } catch (dbError) {
+      console.warn('Aviso: Erro ao atualizar banco de dados:', dbError.message);
+    }
     console.log(`✅ Vídeo renomeado: ${oldFileName} → ${newFileName}`);
 
     res.json({
@@ -334,9 +504,36 @@ router.delete('/:videoId', authMiddleware, async (req, res) => {
 
     const serverId = serverRows.length > 0 ? serverRows[0].codigo_servidor : 1;
 
+    // Obter informações do arquivo antes de deletar
+    const fileInfo = await SSHManager.getFileInfo(serverId, remotePath);
+    const fileSize = fileInfo.exists ? fileInfo.size : 0;
+
     // Deletar vídeo do servidor
     await VideoSSHManager.deleteVideoFromServer(serverId, remotePath);
 
+    // Atualizar banco de dados
+    try {
+      const relativePath = remotePath.replace('/usr/local/WowzaStreamingEngine/content', '');
+      
+      // Remover do banco de dados
+      const [deleteResult] = await db.execute(
+        'DELETE FROM playlists_videos WHERE path_video = ?',
+        [relativePath]
+      );
+      
+      // Atualizar espaço usado se arquivo foi removido
+      if (fileSize > 0) {
+        const sizeMB = Math.ceil(fileSize / (1024 * 1024));
+        await db.execute(
+          'UPDATE streamings SET espaco_usado = GREATEST(espaco_usado - ?, 0) WHERE codigo_cliente = ?',
+          [sizeMB, userId]
+        );
+      }
+      
+      console.log(`✅ Vídeo removido do banco: ${relativePath}`);
+    } catch (dbError) {
+      console.warn('Aviso: Erro ao atualizar banco de dados:', dbError.message);
+    }
     res.json({
       success: true,
       message: 'Vídeo removido com sucesso do servidor'

@@ -100,6 +100,28 @@ const UniversalVideoPlayer: React.FC<UniversalVideoPlayerProps> = ({
     return `/content/${cleanPath}`;
   };
 
+  // Função para construir URL externa do Wowza (baseada no PHP)
+  const buildExternalWowzaUrl = (src: string) => {
+    if (!src) return '';
+    
+    // Se é uma URL SSH, extrair informações do caminho
+    if (src.includes('/api/videos-ssh/stream/')) {
+      // Para SSH, usar URL do proxy por segurança
+      return src;
+    }
+    
+    // Para outros tipos, construir URL direta do Wowza
+    const isProduction = window.location.hostname !== 'localhost';
+    const wowzaHost = isProduction ? 'samhost.wcore.com.br' : '51.222.156.223';
+    
+    if (src.startsWith('/content/')) {
+      return `http://${wowzaHost}:6980${src}`;
+    } else if (!src.startsWith('http')) {
+      return `http://${wowzaHost}:6980/content/${src}`;
+    }
+    
+    return src;
+  };
   // Função para detectar tipo de arquivo
   const getFileType = (url: string) => {
     const extension = url.split('.').pop()?.toLowerCase();
@@ -501,9 +523,15 @@ const UniversalVideoPlayer: React.FC<UniversalVideoPlayerProps> = ({
 
   const handleDownload = () => {
     if (src && !isLive) {
-      // Abrir vídeo em nova aba para download/visualização externa
-      const videoUrl = buildVideoUrl(src);
-      window.open(videoUrl, '_blank');
+      // Usar URL externa do Wowza para melhor performance (baseado no PHP)
+      const externalUrl = buildExternalWowzaUrl(src);
+      const fallbackUrl = buildVideoUrl(src);
+      
+      // Tentar URL externa primeiro, fallback para proxy
+      const newWindow = window.open(externalUrl, '_blank');
+      if (!newWindow) {
+        window.open(fallbackUrl, '_blank');
+      }
     }
   };
 

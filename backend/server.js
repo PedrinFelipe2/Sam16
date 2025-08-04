@@ -121,20 +121,26 @@
       console.log(`🔗 Redirecionando para: ${wowzaUrl}`);
       
       try {
-        // Preparar headers com autenticação básica
-        const authString = Buffer.from(`${wowzaUser}:${wowzaPassword}`).toString('base64');
+        // Preparar headers otimizados (baseado no PHP)
         const requestHeaders = {
           'Range': req.headers.range || '',
           'User-Agent': 'Streaming-System/1.0',
           'Accept': '*/*',
-          'Authorization': `Basic ${authString}`
+          'Cache-Control': isStreamFile ? 'no-cache' : 'public, max-age=3600',
+          'Connection': 'keep-alive'
         };
+        
+        // Adicionar autenticação apenas para arquivos VOD
+        if (!isStreamFile) {
+          const authString = Buffer.from(`${wowzaUser}:${wowzaPassword}`).toString('base64');
+          requestHeaders['Authorization'] = `Basic ${authString}`;
+        }
         
         // Fazer requisição para o Wowza
         const wowzaResponse = await fetch(wowzaUrl, {
           method: req.method,
           headers: requestHeaders,
-          timeout: 10000 // 10 segundos timeout
+          timeout: isStreamFile ? 5000 : 30000 // Timeout diferenciado
         });
         
         if (!wowzaResponse.ok) {
@@ -148,7 +154,7 @@
             const alternativeResponse = await fetch(alternativeUrl, {
               method: req.method,
               headers: requestHeaders,
-              timeout: 10000
+              timeout: 30000
             });
             
             if (alternativeResponse.ok) {

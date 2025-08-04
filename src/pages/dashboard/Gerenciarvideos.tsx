@@ -58,6 +58,15 @@ type CacheStatus = {
   }>;
 };
 
+type FolderUsage = {
+  used: number;
+  total: number;
+  percentage: number;
+  available: number;
+  database_used: number;
+  real_used: number;
+};
+
 function formatarDuracao(segundos: number): string {
   const h = Math.floor(segundos / 3600);
   const m = Math.floor((segundos % 3600) / 60);
@@ -329,6 +338,8 @@ export default function GerenciarVideos() {
   const [loadingSSH, setLoadingSSH] = useState(false);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [editingVideo, setEditingVideo] = useState<EditingVideo | null>(null);
+  const [folderUsage, setFolderUsage] = useState<FolderUsage | null>(null);
+  const [loadingUsage, setLoadingUsage] = useState(false);
 
   // Estados para confirmação
   const [modalConfirmacao, setModalConfirmacao] = useState({
@@ -348,8 +359,10 @@ export default function GerenciarVideos() {
   useEffect(() => {
     if (folderSelecionada) {
       fetchSSHVideos(folderSelecionada.nome);
+      loadFolderUsage(folderSelecionada.id);
     } else {
       setSSHVideos([]);
+      setFolderUsage(null);
     }
   }, [folderSelecionada]);
 
@@ -408,6 +421,55 @@ export default function GerenciarVideos() {
       }
     } catch (error) {
       console.error('Erro ao carregar status do cache:', error);
+    }
+  };
+
+  const loadFolderUsage = async (folderId: number) => {
+    setLoadingUsage(true);
+    try {
+      const token = await getToken();
+      const response = await fetch(`/api/videos-ssh/folders/${folderId}/usage`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success) {
+          setFolderUsage(data.usage);
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao carregar uso da pasta:', error);
+    } finally {
+      setLoadingUsage(false);
+    }
+  };
+
+  const syncFolderWithServer = async (folderId: number) => {
+    if (!confirm('Deseja sincronizar esta pasta com o servidor? Isso pode levar alguns minutos.')) {
+      return;
+    }
+    
+    try {
+      const token = await getToken();
+      const response = await fetch(`/api/videos-ssh/folders/${folderId}/sync`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      const data = await response.json();
+      if (data.success) {
+        toast.success(data.message);
+        if (folderSelecionada) {
+          fetchSSHVideos(folderSelecionada.nome);
+          loadFolderUsage(folderSelecionada.id);
+        }
+      } else {
+        toast.error(data.error);
+      }
+    } catch (error) {
+      console.error('Erro na sincronização:', error);
+      toast.error('Erro na sincronização com servidor');
     }
   };
 
@@ -716,6 +778,46 @@ export default function GerenciarVideos() {
     setModalAberta(true);
   };
 
+  // Função melhorada para abrir vídeo em nova aba (baseada no PHP)
+  const openVideoInNewTab = (video: SSHVideo) => {
+    const isProduction = window.location.hostname !== 'localhost';
+    const wowzaHost = isProduction ? 'samhost.wcore.com.br' : '51.222.156.223';
+    const userLogin = video.userLogin;
+    
+    // Construir URL direta do Wowza (porta 6980 para VOD)
+    const directUrl = `http://${wowzaHost}:6980/content/${userLogin}/${video.folder}/${video.nome}`;
+    
+    // Tentar abrir URL direta primeiro
+    const newWindow = window.open(directUrl, '_blank');
+    
+    if (!newWindow) {
+      // Fallback para URL via proxy se popup foi bloqueado
+      window.open(`/content/${userLogin}/${video.folder}/${video.nome}`, '_blank');
+    }
+  };
+
+  // Função para verificar integridade do vídeo
+  const checkVideoIntegrity = async (video: SSHVideo) => {
+    try {
+      const token = await getToken();
+      const response = await fetch(`/api/videos-ssh/info/${video.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.video_info) {
+          const info = data.video_info;
+          toast.success(`Vídeo íntegro: ${info.duration}s, ${info.codec}, ${info.width}x${info.height}`);
+        } else {
+          toast.warning('Não foi possível verificar a integridade do vídeo');
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao verificar integridade:', error);
+      toast.error('Erro ao verificar integridade do vídeo');
+    }
+  };
   return (
     <>
       <div className="max-w-7xl mx-auto p-6 flex flex-col md:flex-row gap-8 min-h-[700px]">
@@ -732,6 +834,16 @@ export default function GerenciarVideos() {
                   <RefreshCw className={`h-4 w-4 ${loadingSSH ? 'animate-spin' : ''}`} />
                   <span>Atualizar Lista</span>
                 </button>
+                
+                {folderSelecionada && (
+                  <button
+                    onClick={() => syncFolderWithServer(folderSelecionada.id)}
+                    className="flex items-center space-x-1 text-green-600 hover:text-green-800 text-sm"
+                  >
+                    <Download className="h-4 w-4" />
+                    <span>Sincronizar</span>
+                  </button>
+                )}
               </div>
               
               {cacheStatus && (
@@ -752,6 +864,64 @@ export default function GerenciarVideos() {
                 </div>
               )}
             </div>
+            
+            {/* Estatísticas de uso da pasta - baseado no PHP */}
+            {folderUsage && (
+              <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded-md">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-sm font-medium text-gray-700">
+                    Uso da Pasta: {folderSelecionada?.nome}
+                  </h4>
+                  {loadingUsage && (
+                    <RefreshCw className="h-4 w-4 animate-spin text-gray-500" />
+                  )}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-sm">
+                  <div>
+                    <span className="text-gray-500">Usado:</span>
+                    <span className="ml-2 font-medium text-gray-900">
+                      {formatarTamanho(folderUsage.used * 1024 * 1024)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-gray-500">Total:</span>
+                    <span className="ml-2 font-medium text-gray-900">
+                      {formatarTamanho(folderUsage.total * 1024 * 1024)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-gray-500">Disponível:</span>
+                    <span className="ml-2 font-medium text-green-600">
+                      {formatarTamanho(folderUsage.available * 1024 * 1024)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-gray-500">Uso:</span>
+                    <span className={`ml-2 font-medium ${
+                      folderUsage.percentage > 90 ? 'text-red-600' :
+                      folderUsage.percentage > 70 ? 'text-yellow-600' : 'text-green-600'
+                    }`}>
+                      {folderUsage.percentage}%
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-2 w-full bg-gray-200 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all ${
+                      folderUsage.percentage > 90 ? 'bg-red-600' :
+                      folderUsage.percentage > 70 ? 'bg-yellow-600' : 'bg-green-600'
+                    }`}
+                    style={{ width: `${Math.min(folderUsage.percentage, 100)}%` }}
+                  ></div>
+                </div>
+                {folderUsage.real_used !== folderUsage.database_used && (
+                  <p className="text-xs text-yellow-600 mt-1">
+                    ⚠️ Diferença detectada entre servidor ({formatarTamanho(folderUsage.real_used * 1024 * 1024)}) 
+                    e banco ({formatarTamanho(folderUsage.database_used * 1024 * 1024)})
+                  </p>
+                )}
+              </div>
+            )}
             
             <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-md">
               <p className="text-blue-800 text-sm">
@@ -791,6 +961,21 @@ export default function GerenciarVideos() {
                     disabled={sshVideos.length === 0}
                   >
                     <Play size={20} />
+                  </button>
+
+                  {/* Botão para abrir vídeo em nova aba (baseado no PHP) */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (sshVideos.length > 0) {
+                        openVideoInNewTab(sshVideos[0]);
+                      }
+                    }}
+                    title={`Abrir primeiro vídeo da pasta em nova aba`}
+                    className="text-green-600 hover:text-green-800 transition-colors duration-200"
+                    disabled={sshVideos.length === 0}
+                  >
+                    <Eye size={16} />
                   </button>
 
                   {/* Botão para deletar pasta */}
@@ -866,6 +1051,30 @@ export default function GerenciarVideos() {
               </div>
             )}
             
+            {/* Informações da pasta selecionada - baseado no PHP */}
+            {folderSelecionada && !loadingSSH && (
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-medium text-blue-900">
+                      Pasta Selecionada: {folderSelecionada.nome}
+                    </h3>
+                    <p className="text-xs text-blue-700">
+                      {sshVideos.length} vídeo(s) encontrado(s) no servidor
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    {folderUsage && (
+                      <div className="text-xs text-blue-700">
+                        <div>Usado: {formatarTamanho(folderUsage.used * 1024 * 1024)}</div>
+                        <div>Disponível: {formatarTamanho(folderUsage.available * 1024 * 1024)}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+            
             <table className="w-full border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b border-gray-300">
@@ -874,7 +1083,7 @@ export default function GerenciarVideos() {
                   <th className="py-2 px-4 w-28">Tamanho</th>
                   <th className="py-2 px-4 w-32">Pasta</th>
                   <th className="py-2 px-4 w-24">Assistir</th>
-                  <th className="py-2 px-4 w-32">Ações</th>
+                  <th className="py-2 px-4 w-40">Ações</th>
                 </tr>
               </thead>
               <tbody>
@@ -922,6 +1131,14 @@ export default function GerenciarVideos() {
                         ) : (
                           video.nome
                         )}
+                            {/* Indicador de integridade */}
+                            <div className="flex items-center space-x-1">
+                              {video.size > 0 ? (
+                                <div className="w-2 h-2 bg-green-500 rounded-full" title="Arquivo válido" />
+                              ) : (
+                                <div className="w-2 h-2 bg-red-500 rounded-full" title="Arquivo pode estar corrompido" />
+                              )}
+                            </div>
                       </td>
                       <td className="py-2 px-4">{video.duration ? formatarDuracao(video.duration) : "--"}</td>
                       <td className="py-2 px-4">{video.size ? formatarTamanho(video.size) : "--"}</td>
@@ -945,7 +1162,31 @@ export default function GerenciarVideos() {
                         </button>
                       </td>
                       <td className="py-2 px-4 text-center">
-                        <div className="flex items-center justify-center space-x-2">
+                        <div className="flex items-center justify-center space-x-1">
+                          {/* Botão para abrir em nova aba */}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openVideoInNewTab(video);
+                            }}
+                            title="Abrir vídeo em nova aba (Wowza direto)"
+                            className="text-green-600 hover:text-green-800 transition-colors duration-200"
+                          >
+                            <Eye size={14} />
+                          </button>
+                          
+                          {/* Botão para verificar integridade */}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              checkVideoIntegrity(video);
+                            }}
+                            title="Verificar integridade do vídeo"
+                            className="text-purple-600 hover:text-purple-800 transition-colors duration-200"
+                          >
+                            <Activity size={14} />
+                          </button>
+                          
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -955,7 +1196,7 @@ export default function GerenciarVideos() {
                             className="text-blue-600 hover:text-blue-800 transition-colors duration-200"
                             disabled={editingVideo?.id === video.id}
                           >
-                            <Edit2 size={16} />
+                            <Edit2 size={14} />
                           </button>
                           <button
                             onClick={(e) => {
@@ -965,7 +1206,7 @@ export default function GerenciarVideos() {
                             title="Excluir vídeo do servidor"
                             className="text-red-600 hover:text-red-800 transition-colors duration-200"
                           >
-                            <Trash2 size={16} />
+                            <Trash2 size={14} />
                           </button>
                         </div>
                       </td>

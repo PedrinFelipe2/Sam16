@@ -294,19 +294,31 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 
     const serverId = serverRows.length > 0 ? serverRows[0].codigo_servidor : 1;
 
+    // Obter informações do arquivo antes de deletar
+    let fileSize = video.tamanho_arquivo || 0;
     try {
       const remotePath = `/usr/local/WowzaStreamingEngine/content${video.path_video}`;
+      
+      // Verificar tamanho real do arquivo se não estiver no banco
+      if (!fileSize) {
+        const fileInfo = await SSHManager.getFileInfo(serverId, remotePath);
+        fileSize = fileInfo.exists ? fileInfo.size : 0;
+      }
+      
       await SSHManager.deleteFile(serverId, remotePath);
+      console.log(`✅ Arquivo removido do servidor: ${remotePath}`);
     } catch (fileError) {
       console.warn('Erro ao remover arquivo físico:', fileError.message);
     }
 
-    if (video.tamanho_arquivo) {
-      const spaceMB = Math.ceil(video.tamanho_arquivo / (1024 * 1024));
+    // Atualizar espaço usado baseado no tamanho real
+    if (fileSize > 0) {
+      const spaceMB = Math.ceil(fileSize / (1024 * 1024));
       await db.execute(
         'UPDATE streamings SET espaco_usado = GREATEST(espaco_usado - ?, 0) WHERE codigo_cliente = ?',
         [spaceMB, userId]
       );
+      console.log(`📊 Espaço liberado: ${spaceMB}MB`);
     }
 
     await db.execute(

@@ -503,6 +503,84 @@ class VideoSSHManager {
         }
         return `${m}:${s.toString().padStart(2, '0')}`;
     }
+
+    // Método para verificar integridade de vídeos
+    async checkVideoIntegrity(serverId, remotePath) {
+        try {
+            // Verificar se arquivo existe e não está corrompido
+            const ffprobeCommand = `ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "${remotePath}" 2>/dev/null || echo "ERROR"`;
+            const result = await SSHManager.executeCommand(serverId, ffprobeCommand);
+            
+            if (result.stdout.includes('ERROR') || result.stdout.trim() === '0') {
+                return {
+                    valid: false,
+                    reason: 'Arquivo corrompido ou não é um vídeo válido'
+                };
+            }
+            
+            return {
+                valid: true,
+                packets: parseInt(result.stdout.trim()) || 0
+            };
+        } catch (error) {
+            return {
+                valid: false,
+                reason: 'Erro ao verificar integridade'
+            };
+        }
+    }
+
+    // Método para obter URL de streaming otimizada
+    async getOptimizedStreamUrl(serverId, remotePath, userLogin) {
+        try {
+            const fileName = path.basename(remotePath);
+            const folderPath = path.dirname(remotePath).split('/').pop();
+            
+            // Construir URLs baseadas no ambiente
+            const isProduction = process.env.NODE_ENV === 'production';
+            const wowzaHost = isProduction ? 'samhost.wcore.com.br' : '51.222.156.223';
+            
+            // URL direta do Wowza (porta 6980 para VOD)
+            const directUrl = `http://${wowzaHost}:6980/content/${userLogin}/${folderPath}/${fileName}`;
+            
+            // URL HLS se disponível
+            const hlsUrl = `http://${wowzaHost}:1935/vod/${userLogin}/${folderPath}/${fileName}/playlist.m3u8`;
+            
+            // URL via proxy do backend
+            const proxyUrl = `/content/${userLogin}/${folderPath}/${fileName}`;
+            
+            return {
+                direct: directUrl,
+                hls: hlsUrl,
+                proxy: proxyUrl,
+                ssh: `/api/videos-ssh/stream/${Buffer.from(remotePath).toString('base64')}`
+            };
+        } catch (error) {
+            console.error('Erro ao gerar URLs:', error);
+            return null;
+        }
+    }
+
+    // Método para limpar arquivos órfãos
+    async cleanupOrphanedFiles(serverId, userLogin) {
+        try {
+            const userPath = `/usr/local/WowzaStreamingEngine/content/${userLogin}`;
+            
+            // Encontrar arquivos temporários ou corrompidos
+            const cleanupCommand = `find "${userPath}" -type f \\( -name "*.tmp" -o -name "*.part" -o -size 0 \\) -delete 2>/dev/null || true`;
+            await SSHManager.executeCommand(serverId, cleanupCommand);
+            
+            // Remover diretórios vazios
+            const removeDirsCommand = `find "${userPath}" -type d -empty -delete 2>/dev/null || true`;
+            await SSHManager.executeCommand(serverId, removeDirsCommand);
+            
+            console.log(`🧹 Limpeza concluída para usuário ${userLogin}`);
+            return { success: true };
+        } catch (error) {
+            console.error('Erro na limpeza:', error);
+            return { success: false, error: error.message };
+        }
+    }
 }
 
 module.exports = new VideoSSHManager();
